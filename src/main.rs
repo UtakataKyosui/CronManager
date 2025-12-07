@@ -18,10 +18,11 @@ use storage::Storage;
 fn main() -> Result<()> {
     // Parse command line arguments
     let args: Vec<String> = std::env::args().collect();
-    let storage = if args.len() > 1 && args[1] == "--system" {
-        Storage::with_system_crontab()
-    } else {
+    let storage = if args.len() > 1 && args[1] == "--local" {
         Storage::new(None)
+    } else {
+        // Default: use system crontab
+        Storage::with_system_crontab()
     };
 
     // Setup terminal

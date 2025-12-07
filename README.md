@@ -41,21 +41,23 @@ cargo install --path .
 ### 基本的な起動
 
 ```bash
-# ローカルファイルモード（~/.cron-manager-crontab を使用）
+# デフォルト: システムcrontabを直接編集
 cargo run
 
 # または、ビルド済みバイナリを使用
 ./target/release/cron-manager
 ```
 
-### システムcrontabモード
+### ローカルファイルモード
 
-実際のシステムcrontabを編集する場合：
+システムcrontabに影響を与えずにテストする場合：
 
 ```bash
-# システムcrontabを使用（注意: 実際のcrontabが変更されます）
-./target/release/cron-manager --system
+# ローカルファイルモード（~/.cron-manager-crontab を使用）
+./target/release/cron-manager --local
 ```
+
+**注意**: デフォルトモードでは実際のシステムcrontabが変更されます。
 
 ## 操作方法
 
