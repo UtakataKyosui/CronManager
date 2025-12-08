@@ -13,3 +13,4 @@ chrono = "0.4"
 anyhow = "1.0"
 dirs = "5.0"
 tempfile = "3.8"
+uuid = { version = "1.6", features = ["v5"] }
