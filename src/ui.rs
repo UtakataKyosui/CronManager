@@ -18,14 +18,15 @@ pub fn draw(f: &mut Frame, app: &App) {
         ])
         .split(f.area());
 
-    draw_title(f, chunks[0]);
+    draw_title(f, chunks[0], app);
     draw_table(f, app, chunks[1]);
     draw_input_or_message(f, app, chunks[2]);
     draw_help(f, app, chunks[3]);
 }
 
-fn draw_title(f: &mut Frame, area: Rect) {
-    let title = Paragraph::new("Cron Manager")
+fn draw_title(f: &mut Frame, area: Rect, app: &App) {
+    let backend = app.storage.get_backend_name();
+    let title = Paragraph::new(format!("Cron Manager [Backend: {}]", backend))
         .style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))
         .block(Block::default().borders(Borders::ALL));
     f.render_widget(title, area);

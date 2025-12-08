@@ -1,11 +1,5 @@
-mod app;
-mod cron_entry;
-mod cron_parser;
-mod storage;
-mod ui;
-
 use anyhow::Result;
-use app::{App, InputMode};
+use cron_manager::{app::{App, InputMode}, storage::Storage, ui};
 use crossterm::{
     event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind},
     execute,
@@ -13,7 +7,6 @@ use crossterm::{
 };
 use ratatui::{backend::CrosstermBackend, Terminal};
 use std::io;
-use storage::Storage;
 
 fn main() -> Result<()> {
     // Parse command line arguments
@@ -21,8 +14,8 @@ fn main() -> Result<()> {
     let storage = if args.len() > 1 && args[1] == "--local" {
         Storage::new(None)
     } else {
-        // Default: use system crontab
-        Storage::with_system_crontab()
+        // Default: use system scheduler (cron on Linux, launchd on macOS)
+        Storage::with_system_scheduler()
     };
 
     // Setup terminal
