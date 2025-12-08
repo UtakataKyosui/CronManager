@@ -1,9 +1,16 @@
 use crate::cron_entry::CronEntry;
 use crate::scheduler::Scheduler;
 use anyhow::{Context, Result};
+use std::collections::hash_map::DefaultHasher;
 use std::fs;
+use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::process::Command;
+
+// Constants
+const LABEL_PREFIX: &str = "com.cronmanager";
+const STDOUT_PATH_PREFIX: &str = "/tmp";
+const STDERR_PATH_PREFIX: &str = "/tmp";
 
 /// Launchd-based scheduler for macOS
 pub struct LaunchdScheduler {
@@ -28,14 +35,58 @@ impl LaunchdScheduler {
     }
 
     fn entry_to_label(&self, entry: &CronEntry) -> String {
-        // Create a unique label for this entry
-        // Replace spaces and special characters with underscores
-        let safe_name = entry.name.replace(' ', "_").replace('/', "_");
-        format!("com.cronmanager.{}", safe_name)
+        // Create a unique label for this entry using a hash to avoid collisions
+        // Different names like "My Task" and "My/Task" should have different labels
+        let mut hasher = DefaultHasher::new();
+        entry.name.hash(&mut hasher);
+        let hash = hasher.finish();
+
+        // Create a safe name for readability (alphanumeric only)
+        let safe_name: String = entry.name
+            .chars()
+            .filter(|c| c.is_alphanumeric() || *c == '_')
+            .take(32) // Limit length
+            .collect();
+
+        format!("{}.{}.{:x}", LABEL_PREFIX, safe_name, hash)
     }
 
     fn plist_path(&self, label: &str) -> PathBuf {
         self.launch_agents_dir.join(format!("{}.plist", label))
+    }
+
+    fn escape_xml(&self, text: &str) -> String {
+        text.replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
+            .replace('\'', "&apos;")
+            .replace('"', "&quot;")
+    }
+
+    fn unescape_xml(&self, text: &str) -> String {
+        text.replace("&amp;", "&")
+            .replace("&lt;", "<")
+            .replace("&gt;", ">")
+            .replace("&apos;", "'")
+            .replace("&quot;", "\"")
+    }
+
+    fn get_uid(&self) -> Result<String> {
+        // Get the current user's UID using the id command
+        let output = Command::new("id")
+            .arg("-u")
+            .output()
+            .context("Failed to get user ID")?;
+
+        if !output.status.success() {
+            anyhow::bail!("Failed to get user ID");
+        }
+
+        let uid = String::from_utf8_lossy(&output.stdout)
+            .trim()
+            .to_string();
+
+        Ok(uid)
     }
 
     fn cron_to_calendar_interval(&self, schedule: &str) -> Result<String> {
@@ -50,6 +101,56 @@ impl LaunchdScheduler {
         let day = parts[2];
         let month = parts[3];
         let weekday = parts[4];
+
+        // Validate that cron expressions are supported (simple values only)
+        // launchd doesn't support ranges (1-5), lists (1,3,5), or step values (*/15)
+        for (i, part) in parts.iter().enumerate() {
+            let field_name = match i {
+                0 => "minute",
+                1 => "hour",
+                2 => "day",
+                3 => "month",
+                4 => "weekday",
+                _ => unreachable!(),
+            };
+
+            if part.contains('-') {
+                anyhow::bail!(
+                    "Cron expression contains unsupported range '{}' in {} field. \
+                     launchd only supports simple values or * wildcard.",
+                    part, field_name
+                );
+            }
+            if part.contains(',') {
+                anyhow::bail!(
+                    "Cron expression contains unsupported list '{}' in {} field. \
+                     launchd only supports simple values or * wildcard.",
+                    part, field_name
+                );
+            }
+            if part.contains('/') {
+                anyhow::bail!(
+                    "Cron expression contains unsupported step value '{}' in {} field. \
+                     launchd only supports simple values or * wildcard.",
+                    part, field_name
+                );
+            }
+            if part.starts_with('@') {
+                anyhow::bail!(
+                    "Cron expression contains unsupported special syntax '{}'. \
+                     Please use explicit minute/hour/day values.",
+                    part
+                );
+            }
+
+            // Validate it's either * or a number
+            if *part != "*" && part.parse::<u32>().is_err() {
+                anyhow::bail!(
+                    "Invalid value '{}' in {} field. Must be a number or *.",
+                    part, field_name
+                );
+            }
+        }
 
         // Convert to launchd calendar format
         let mut calendar_dict = String::new();
@@ -87,17 +188,14 @@ impl LaunchdScheduler {
         let label = self.entry_to_label(entry);
         let calendar = self.cron_to_calendar_interval(&entry.schedule)?;
 
-        // Split command into program and arguments
-        let cmd_parts: Vec<&str> = entry.command.split_whitespace().collect();
-        let program = cmd_parts.get(0).unwrap_or(&"");
-        let args = &cmd_parts[1..];
-
-        let mut plist = format!(
+        let plist = format!(
             r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
     <key>Label</key>
+    <string>{}</string>
+    <key>CronManagerTaskName</key>
     <string>{}</string>
     <key>ProgramArguments</key>
     <array>
@@ -109,16 +207,19 @@ impl LaunchdScheduler {
     <dict>
 {}    </dict>
     <key>StandardOutPath</key>
-    <string>/tmp/{}.stdout</string>
+    <string>{}/{}.stdout</string>
     <key>StandardErrorPath</key>
-    <string>/tmp/{}.stderr</string>
+    <string>{}/{}.stderr</string>
 </dict>
 </plist>
 "#,
             label,
-            entry.command.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;"),
+            self.escape_xml(&entry.name),
+            self.escape_xml(&entry.command),
             calendar,
+            STDOUT_PATH_PREFIX,
             label,
+            STDERR_PATH_PREFIX,
             label
         );
 
@@ -128,15 +229,24 @@ impl LaunchdScheduler {
     fn load_agent(&self, label: &str) -> Result<()> {
         let plist_path = self.plist_path(label);
 
+        // Use modern bootstrap command (macOS 10.11+)
+        // Format: launchctl bootstrap gui/<uid> <plist_path>
+        let uid = self.get_uid()?;
+        let domain = format!("gui/{}", uid);
+
         let output = Command::new("launchctl")
-            .arg("load")
+            .arg("bootstrap")
+            .arg(&domain)
             .arg(&plist_path)
             .output()
-            .context("Failed to execute launchctl load")?;
+            .context("Failed to execute launchctl bootstrap")?;
 
         if !output.status.success() {
             let error = String::from_utf8_lossy(&output.stderr);
-            eprintln!("Warning: Failed to load launch agent {}: {}", label, error);
+            // Only fail if it's not already loaded
+            if !error.contains("Already loaded") && !error.contains("service already loaded") {
+                anyhow::bail!("Failed to load launch agent {}: {}", label, error);
+            }
         }
 
         Ok(())
@@ -149,13 +259,19 @@ impl LaunchdScheduler {
             return Ok(());
         }
 
-        let output = Command::new("launchctl")
-            .arg("unload")
-            .arg(&plist_path)
-            .output()
-            .context("Failed to execute launchctl unload")?;
+        // Use modern bootout command (macOS 10.11+)
+        // Format: launchctl bootout gui/<uid>/<label>
+        let uid = self.get_uid()?;
+        let service_target = format!("gui/{}/{}", uid, label);
 
-        // Ignore errors on unload (agent might not be loaded)
+        let _output = Command::new("launchctl")
+            .arg("bootout")
+            .arg(&service_target)
+            .output()
+            .context("Failed to execute launchctl bootout")?;
+
+        // Ignore errors on bootout (agent might not be loaded)
+        // This is expected behavior when unloading agents that aren't running
         Ok(())
     }
 
@@ -172,7 +288,7 @@ impl LaunchdScheduler {
 
             if path.extension().and_then(|s| s.to_str()) == Some("plist") {
                 if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
-                    if stem.starts_with("com.cronmanager.") {
+                    if stem.starts_with(LABEL_PREFIX) {
                         labels.push(stem.to_string());
                     }
                 }
@@ -186,9 +302,20 @@ impl LaunchdScheduler {
         let content = fs::read_to_string(path)?;
 
         // Simple XML parsing (we know our own format)
-        // Extract label
-        let label = self.extract_xml_value(&content, "Label")
-            .unwrap_or_else(|| "Unknown".to_string());
+        // Extract name from CronManagerTaskName if available, otherwise from Label
+        let name = if let Some(task_name) = self.extract_xml_value(&content, "CronManagerTaskName") {
+            self.unescape_xml(&task_name)
+        } else {
+            // Fallback for old format: extract from label
+            let label = self.extract_xml_value(&content, "Label")
+                .unwrap_or_else(|| "Unknown".to_string());
+            label.strip_prefix(&format!("{}.", LABEL_PREFIX))
+                .unwrap_or(&label)
+                .split('.')
+                .next()
+                .unwrap_or(&label)
+                .replace('_', " ")
+        };
 
         // Extract command from ProgramArguments (it's the third string, after /bin/sh and -c)
         let command = self.extract_command(&content)
@@ -197,11 +324,6 @@ impl LaunchdScheduler {
         // Extract calendar interval and convert back to cron
         let schedule = self.extract_calendar_to_cron(&content)
             .unwrap_or_else(|| "0 0 * * *".to_string());
-
-        // Extract name from label
-        let name = label.strip_prefix("com.cronmanager.")
-            .unwrap_or(&label)
-            .replace('_', " ");
 
         Ok(CronEntry::new(name, schedule, command))
     }
@@ -237,7 +359,7 @@ impl LaunchdScheduler {
                     if let Some(string_end) = after_array[pos..].find("</string>") {
                         let cmd = &after_array[pos..pos + string_end];
                         // Decode XML entities
-                        return Some(cmd.replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">"));
+                        return Some(self.unescape_xml(cmd));
                     }
                 }
             }
