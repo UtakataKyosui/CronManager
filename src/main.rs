@@ -21,8 +21,8 @@ fn main() -> Result<()> {
     let storage = if args.len() > 1 && args[1] == "--local" {
         Storage::new(None)
     } else {
-        // Default: use system crontab
-        Storage::with_system_crontab()
+        // Default: use system scheduler (cron on Linux, launchd on macOS)
+        Storage::with_system_scheduler()
     };
 
     // Setup terminal

@@ -1,14 +1,17 @@
 # Cron Manager
 
-LinuxとmacOSのためのCron管理TUI（Terminal User Interface）アプリケーション。Crontabエントリを視覚的に管理し、簡単に追加・編集・削除できます。
+LinuxとmacOSのためのスケジュールタスク管理TUI（Terminal User Interface）アプリケーション。Cronエントリを視覚的に管理し、簡単に追加・編集・削除できます。
+
+**OS自動判定機能**: LinuxではCron、macOSではLaunchdを自動的に選択して使用します。
 
 ## 特徴
 
+- **OS自動判定**: LinuxではCron、macOSではLaunchdを自動選択
 - **表形式UI**: 名前、スケジュール、コマンドを見やすい表形式で表示
 - **簡単な編集**: キーボードショートカットで直感的に操作
 - **有効/無効の切り替え**: エントリを削除せずに一時的に無効化可能
-- **安全な管理**: 実際のcrontabを直接編集せず、ローカルファイルで管理（オプションでシステムcrontabも使用可能）
-- **名前付き管理**: 各Cronエントリに分かりやすい名前を付けて管理
+- **安全な管理**: ローカルファイルで管理（オプションでシステムスケジューラも使用可能）
+- **名前付き管理**: 各エントリに分かりやすい名前を付けて管理
 
 ## インストール
 
@@ -41,7 +44,8 @@ cargo install --path .
 ### 基本的な起動
 
 ```bash
-# デフォルト: システムcrontabを直接編集
+# デフォルト: システムスケジューラを直接編集
+# Linux: crontab、macOS: launchd
 cargo run
 
 # または、ビルド済みバイナリを使用
@@ -50,14 +54,17 @@ cargo run
 
 ### ローカルファイルモード
 
-システムcrontabに影響を与えずにテストする場合：
+システムスケジューラに影響を与えずにテストする場合：
 
 ```bash
 # ローカルファイルモード（~/.cron-manager-crontab を使用）
 ./target/release/cron-manager --local
 ```
 
-**注意**: デフォルトモードでは実際のシステムcrontabが変更されます。
+**注意**:
+- デフォルトモードでは実際のシステムスケジューラが変更されます
+- **Linux**: システムのcrontabが更新されます
+- **macOS**: `~/Library/LaunchAgents/` にplistファイルが作成・管理されます
 
 ## 操作方法
 
@@ -133,6 +140,15 @@ Cron Managerは、各エントリに名前を付けるために特別なコメ�
 # 0 3 * * * /path/to/disabled.sh
 ```
 
+## macOSでの動作
+
+macOSでは、Cronの代わりにLaunchdを使用します：
+
+- **自動変換**: Cron式を自動的にLaunchdのCalendarIntervalに変換
+- **Plist生成**: `~/Library/LaunchAgents/com.cronmanager.*.plist` ファイルを自動生成
+- **無効化**: エントリを無効にするとplistファイルが削除され、launchctlからアンロードされます
+- **ログ**: 各ジョブのログは `/tmp/com.cronmanager.*.stdout` と `/tmp/com.cronmanager.*.stderr` に保存されます
+
 ## プロジェクト構造
 
 ```
@@ -142,7 +158,12 @@ CronManager/
 │   ├── app.rs            # アプリケーション状態管理
 │   ├── cron_entry.rs     # Cronエントリのデータ構造
 │   ├── cron_parser.rs    # Crontab解析ロジック
-│   ├── storage.rs        # ファイルI/O
+│   ├── storage.rs        # ストレージ抽象化レイヤー
+│   ├── scheduler/        # スケジューラバックエンド
+│   │   ├── mod.rs        # スケジューラトレイト定義
+│   │   ├── file.rs       # ローカルファイルバックエンド
+│   │   ├── cron.rs       # Cronバックエンド（Linux/Unix）
+│   │   └── launchd.rs    # Launchdバックエンド（macOS）
 │   └── ui.rs             # TUI描画ロジック
 ├── Cargo.toml            # 依存関係設定
 └── README.md             # このファイル
@@ -156,13 +177,14 @@ CronManager/
 - **Cron**: Cron式の解析
 - **Serde**: シリアライゼーション
 
-## 今後の機能統合について
+## アーキテクチャ
 
-このアプリケーションはモジュール化された設計になっており、将来的に他のTUIと統合することを想定しています：
+このアプリケーションは、プラットフォーム間の違いを抽象化する設計になっています：
 
-1. **モジュール化された構造**: 各機能が独立したモジュールとして実装
-2. **Storage抽象化**: ファイルI/Oが`Storage`トレイトを通じて抽象化
-3. **再利用可能なコンポーネント**: `CronEntry`や`CronParser`は他のプロジェクトでも使用可能
+1. **Schedulerトレイト**: 異なるスケジューラバックエンド（Cron、Launchd、ファイル）を統一的に扱うためのトレイト
+2. **OS自動判定**: コンパイル時に`target_os`を使用してプラットフォームを判定し、適切なバックエンドを選択
+3. **Storage抽象化**: ユーザーコードはスケジューラの実装詳細を意識せず、統一されたAPIで操作
+4. **再利用可能なコンポーネント**: `CronEntry`や`CronParser`は他のプロジェクトでも使用可能
 
 ## ライセンス
 
