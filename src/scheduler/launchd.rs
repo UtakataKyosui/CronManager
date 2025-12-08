@@ -89,7 +89,39 @@ impl LaunchdScheduler {
         Ok(uid)
     }
 
+    fn validate_command(&self, command: &str) -> Result<()> {
+        // Validate command to prevent shell injection vulnerabilities
+        // Check for dangerous shell metacharacters that could be exploited
+        let dangerous_chars = ['|', '&', ';', '\n', '\r', '`', '$'];
+
+        for ch in dangerous_chars {
+            if command.contains(ch) {
+                eprintln!(
+                    "Warning: Command contains potentially dangerous character '{}'. \
+                     Consider reviewing the command for security concerns.",
+                    ch
+                );
+            }
+        }
+
+        // Ensure command is not empty
+        if command.trim().is_empty() {
+            anyhow::bail!("Command cannot be empty");
+        }
+
+        Ok(())
+    }
+
     fn cron_to_calendar_interval(&self, schedule: &str) -> Result<String> {
+        // Check for special syntax first (like @daily, @hourly, etc.)
+        if schedule.starts_with('@') {
+            anyhow::bail!(
+                "Cron expression contains unsupported special syntax '{}'. \
+                 Please use explicit minute/hour/day values.",
+                schedule
+            );
+        }
+
         // Parse cron expression: minute hour day month weekday
         let parts: Vec<&str> = schedule.split_whitespace().collect();
         if parts.len() != 5 {
@@ -135,13 +167,6 @@ impl LaunchdScheduler {
                     part, field_name
                 );
             }
-            if part.starts_with('@') {
-                anyhow::bail!(
-                    "Cron expression contains unsupported special syntax '{}'. \
-                     Please use explicit minute/hour/day values.",
-                    part
-                );
-            }
 
             // Validate it's either * or a number
             if *part != "*" && part.parse::<u32>().is_err() {
@@ -185,6 +210,9 @@ impl LaunchdScheduler {
     }
 
     fn create_plist(&self, entry: &CronEntry) -> Result<String> {
+        // Validate command before creating plist
+        self.validate_command(&entry.command)?;
+
         let label = self.entry_to_label(entry);
         let calendar = self.cron_to_calendar_interval(&entry.schedule)?;
 
@@ -401,8 +429,14 @@ impl Scheduler for LaunchdScheduler {
 
         for label in labels {
             let plist_path = self.plist_path(&label);
-            if let Ok(entry) = self.parse_plist(&plist_path) {
-                entries.push(entry);
+            match self.parse_plist(&plist_path) {
+                Ok(entry) => entries.push(entry),
+                Err(e) => {
+                    eprintln!(
+                        "Warning: Failed to parse plist for label '{}': {}",
+                        label, e
+                    );
+                }
             }
         }
 
@@ -412,29 +446,47 @@ impl Scheduler for LaunchdScheduler {
     fn save(&self, entries: &[CronEntry]) -> Result<()> {
         self.ensure_launch_agents_dir()?;
 
-        // Get list of existing agents managed by us
-        let existing_labels = self.list_agents()?;
-
-        // Unload and remove all existing agents
-        for label in existing_labels {
-            self.unload_agent(&label)?;
-            let plist_path = self.plist_path(&label);
-            if plist_path.exists() {
-                fs::remove_file(&plist_path)?;
-            }
-        }
-
-        // Create and load new agents for enabled entries
+        // Phase 1: Create all new plist files with .new suffix
+        let mut new_plists = Vec::new();
         for entry in entries {
             if entry.enabled {
                 let plist_content = self.create_plist(entry)?;
                 let label = self.entry_to_label(entry);
                 let plist_path = self.plist_path(&label);
+                let temp_plist_path = plist_path.with_extension("plist.new");
 
-                fs::write(&plist_path, plist_content)
-                    .with_context(|| format!("Failed to write plist: {:?}", plist_path))?;
+                fs::write(&temp_plist_path, plist_content)
+                    .with_context(|| format!("Failed to write temp plist: {:?}", temp_plist_path))?;
 
-                self.load_agent(&label)?;
+                new_plists.push((label, plist_path, temp_plist_path));
+            }
+        }
+
+        // Phase 2: Get list of existing agents and unload them
+        let existing_labels = self.list_agents()?;
+        for label in &existing_labels {
+            self.unload_agent(label)?;
+        }
+
+        // Phase 3: Remove old plist files
+        for label in &existing_labels {
+            let plist_path = self.plist_path(label);
+            if plist_path.exists() {
+                fs::remove_file(&plist_path)
+                    .with_context(|| format!("Failed to remove old plist: {:?}", plist_path))?;
+            }
+        }
+
+        // Phase 4: Atomically rename new plist files
+        for (_label, plist_path, temp_plist_path) in &new_plists {
+            fs::rename(temp_plist_path, plist_path)
+                .with_context(|| format!("Failed to rename plist: {:?} -> {:?}", temp_plist_path, plist_path))?;
+        }
+
+        // Phase 5: Load all new agents
+        for (label, _plist_path, _temp_plist_path) in &new_plists {
+            if let Err(e) = self.load_agent(label) {
+                eprintln!("Warning: Failed to load agent '{}': {}", label, e);
             }
         }
 
@@ -443,5 +495,171 @@ impl Scheduler for LaunchdScheduler {
 
     fn backend_name(&self) -> &'static str {
         "Launchd"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_launchd_scheduler_backend_name() {
+        let scheduler = LaunchdScheduler::new();
+        assert_eq!(scheduler.backend_name(), "Launchd");
+    }
+
+    #[test]
+    fn test_xml_escape_and_unescape_roundtrip() {
+        let scheduler = LaunchdScheduler::new();
+
+        let test_strings = vec![
+            "simple text",
+            "text with & ampersand",
+            "text with < less than",
+            "text with > greater than",
+            "text with 'apostrophe'",
+            "text with \"quotes\"",
+            "&<>\"'",
+            "complex & text < with > all 'special' \"characters\"",
+        ];
+
+        for original in test_strings {
+            let escaped = scheduler.escape_xml(original);
+            let unescaped = scheduler.unescape_xml(&escaped);
+            assert_eq!(
+                original, unescaped,
+                "Roundtrip failed for: {}",
+                original
+            );
+        }
+    }
+
+    #[test]
+    fn test_entry_to_label_uniqueness() {
+        let scheduler = LaunchdScheduler::new();
+
+        // Different names should generate different labels
+        let entry1 = CronEntry::new("My Task".to_string(), "0 0 * * *".to_string(), "echo".to_string());
+        let entry2 = CronEntry::new("My/Task".to_string(), "0 0 * * *".to_string(), "echo".to_string());
+        let entry3 = CronEntry::new("My_Task".to_string(), "0 0 * * *".to_string(), "echo".to_string());
+
+        let label1 = scheduler.entry_to_label(&entry1);
+        let label2 = scheduler.entry_to_label(&entry2);
+        let label3 = scheduler.entry_to_label(&entry3);
+
+        // All labels should be different
+        assert_ne!(label1, label2, "Labels should be unique for different names");
+        assert_ne!(label1, label3, "Labels should be unique for different names");
+        assert_ne!(label2, label3, "Labels should be unique for different names");
+
+        // All labels should start with the prefix
+        assert!(label1.starts_with(LABEL_PREFIX));
+        assert!(label2.starts_with(LABEL_PREFIX));
+        assert!(label3.starts_with(LABEL_PREFIX));
+    }
+
+    #[test]
+    fn test_entry_to_label_consistency() {
+        let scheduler = LaunchdScheduler::new();
+
+        // Same entry should always generate the same label
+        let entry = CronEntry::new("Test Task".to_string(), "0 0 * * *".to_string(), "echo".to_string());
+
+        let label1 = scheduler.entry_to_label(&entry);
+        let label2 = scheduler.entry_to_label(&entry);
+
+        assert_eq!(label1, label2, "Same entry should generate consistent labels");
+    }
+
+    #[test]
+    fn test_validate_command_empty() {
+        let scheduler = LaunchdScheduler::new();
+
+        let result = scheduler.validate_command("");
+        assert!(result.is_err(), "Empty command should fail validation");
+
+        let result = scheduler.validate_command("   ");
+        assert!(result.is_err(), "Whitespace-only command should fail validation");
+    }
+
+    #[test]
+    fn test_validate_command_simple() {
+        let scheduler = LaunchdScheduler::new();
+
+        let result = scheduler.validate_command("echo hello");
+        assert!(result.is_ok(), "Simple command should pass validation");
+    }
+
+    #[test]
+    fn test_cron_to_calendar_valid_expressions() {
+        let scheduler = LaunchdScheduler::new();
+
+        // Test simple valid expressions
+        let result = scheduler.cron_to_calendar_interval("0 0 * * *");
+        assert!(result.is_ok(), "Simple cron expression should be valid");
+
+        let result = scheduler.cron_to_calendar_interval("30 14 * * *");
+        assert!(result.is_ok(), "Cron with specific hour and minute should be valid");
+
+        let result = scheduler.cron_to_calendar_interval("0 0 1 1 *");
+        assert!(result.is_ok(), "Cron with specific day and month should be valid");
+    }
+
+    #[test]
+    fn test_cron_to_calendar_invalid_expressions() {
+        let scheduler = LaunchdScheduler::new();
+
+        // Test unsupported expressions
+        let result = scheduler.cron_to_calendar_interval("0-30 * * * *");
+        assert!(result.is_err(), "Range expression should be rejected");
+        assert!(result.unwrap_err().to_string().contains("range"));
+
+        let result = scheduler.cron_to_calendar_interval("0,30 * * * *");
+        assert!(result.is_err(), "List expression should be rejected");
+        assert!(result.unwrap_err().to_string().contains("list"));
+
+        let result = scheduler.cron_to_calendar_interval("*/15 * * * *");
+        assert!(result.is_err(), "Step value expression should be rejected");
+        assert!(result.unwrap_err().to_string().contains("step"));
+
+        let result = scheduler.cron_to_calendar_interval("@daily");
+        assert!(result.is_err(), "Special syntax should be rejected");
+        assert!(result.unwrap_err().to_string().contains("special"));
+
+        let result = scheduler.cron_to_calendar_interval("invalid * * * *");
+        assert!(result.is_err(), "Invalid value should be rejected");
+
+        let result = scheduler.cron_to_calendar_interval("0 0 * *");
+        assert!(result.is_err(), "Incomplete expression should be rejected");
+    }
+
+    #[test]
+    fn test_cron_to_calendar_minute_hour() {
+        let scheduler = LaunchdScheduler::new();
+
+        // Test specific minute and hour
+        let result = scheduler.cron_to_calendar_interval("30 14 * * *");
+        assert!(result.is_ok());
+        let calendar = result.unwrap();
+
+        assert!(calendar.contains("<key>Minute</key>"));
+        assert!(calendar.contains("<integer>30</integer>"));
+        assert!(calendar.contains("<key>Hour</key>"));
+        assert!(calendar.contains("<integer>14</integer>"));
+    }
+
+    #[test]
+    fn test_create_plist_validates_command() {
+        let scheduler = LaunchdScheduler::new();
+
+        // Empty command should fail
+        let entry = CronEntry::new("test".to_string(), "0 0 * * *".to_string(), "".to_string());
+        let result = scheduler.create_plist(&entry);
+        assert!(result.is_err(), "Empty command should fail");
+
+        // Invalid cron should fail
+        let entry = CronEntry::new("test".to_string(), "invalid".to_string(), "echo test".to_string());
+        let result = scheduler.create_plist(&entry);
+        assert!(result.is_err(), "Invalid cron expression should fail");
     }
 }
